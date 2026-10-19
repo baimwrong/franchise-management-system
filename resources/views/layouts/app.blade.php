@@ -304,7 +304,7 @@
                     </label>
                     <select name="outlet_id" id="outletSelect" class="form-select form-select-sm" style="min-width: 200px;" onchange="this.form.submit()">
                         <option value="">-- All Brand Outlets (Consolidated) --</option>
-                        @foreach(\App\Models\Outlet::orderBy('name')->get() as $out)
+                        @foreach(auth()->user()->accessibleOutletsQuery()->active()->orderBy('name')->get() as $out)
                             <option value="{{ $out->id }}" {{ session('active_outlet_id') == $out->id ? 'selected' : '' }}>
                                 {{ $out->name }} ({{ $out->outlet_code }})
                             </option>

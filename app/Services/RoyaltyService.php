@@ -19,34 +19,44 @@ class RoyaltyService
         $royaltyPercent = (float) ($brand->royalty_rate_percentage ?? 5.00);
         $marketingPercent = (float) ($brand->marketing_fund_percentage ?? 2.00);
 
-        // Sum paid sales transactions in the period for this outlet
+        // Sum paid sales transactions in the period for this outlet (copy dates to prevent mutating arguments)
         $grossSales = (float) SalesTransaction::where('outlet_id', $outlet->id)
             ->where('payment_status', 'paid')
-            ->whereBetween('transaction_date', [$periodStart->startOfDay(), $periodEnd->endOfDay()])
+            ->whereBetween('transaction_date', [$periodStart->copy()->startOfDay(), $periodEnd->copy()->endOfDay()])
             ->sum('total_amount');
 
         $royaltyFee = round(($grossSales * $royaltyPercent) / 100, 2);
         $marketingFee = round(($grossSales * $marketingPercent) / 100, 2);
-        $techFee = 50.00; // Fixed monthly franchise portal tech fee
+        $techFee = (float) ($brand->settings['monthly_portal_tech_fee'] ?? 50.00);
         $totalDue = $royaltyFee + $marketingFee + $techFee;
 
         $invoiceNumber = 'ROY-'.$outlet->outlet_code.'-'.$periodStart->format('Ym');
 
+        $existing = RoyaltyInvoice::where('invoice_number', $invoiceNumber)->first();
+        if ($existing && $existing->status === 'paid') {
+            return $existing;
+        }
+
+        $invoiceData = [
+            'outlet_id' => $outlet->id,
+            'period_start' => $periodStart->toDateString(),
+            'period_end' => $periodEnd->toDateString(),
+            'gross_sales' => $grossSales,
+            'royalty_percentage' => $royaltyPercent,
+            'royalty_fee' => $royaltyFee,
+            'marketing_fee' => $marketingFee,
+            'technology_fee' => $techFee,
+            'total_amount_due' => $totalDue,
+            'due_date' => $periodEnd->copy()->addDays(15)->toDateString(),
+        ];
+
+        if (! $existing) {
+            $invoiceData['status'] = 'issued';
+        }
+
         return RoyaltyInvoice::updateOrCreate(
             ['invoice_number' => $invoiceNumber],
-            [
-                'outlet_id' => $outlet->id,
-                'period_start' => $periodStart->toDateString(),
-                'period_end' => $periodEnd->toDateString(),
-                'gross_sales' => $grossSales,
-                'royalty_percentage' => $royaltyPercent,
-                'royalty_fee' => $royaltyFee,
-                'marketing_fee' => $marketingFee,
-                'technology_fee' => $techFee,
-                'total_amount_due' => $totalDue,
-                'status' => 'issued',
-                'due_date' => $periodEnd->copy()->addDays(15)->toDateString(),
-            ]
+            $invoiceData
         );
     }
 

@@ -13,7 +13,8 @@ class OutletController extends Controller
 {
     public function index(Request $request): View
     {
-        $query = Outlet::with(['region', 'brand'])
+        $user = $request->user();
+        $query = $user->accessibleOutletsQuery()->with(['region', 'brand'])
             ->withCount(['inventoryStocks', 'users']);
 
         if ($search = $request->input('search')) {
@@ -39,8 +40,13 @@ class OutletController extends Controller
         return view('outlets.index', compact('outlets', 'regions'));
     }
 
-    public function show(Outlet $outlet): View
+    public function show(Request $request, Outlet $outlet): View
     {
+        $user = $request->user();
+        if (! $user->canManageOutlet($outlet->id)) {
+            abort(403, 'Unauthorized to view this store outlet.');
+        }
+
         $outlet->load(['region', 'brand', 'users']);
 
         $recentSales = $outlet->salesTransactions()->latest('transaction_date')->limit(10)->get();
@@ -101,8 +107,13 @@ class OutletController extends Controller
             ->with('status', "Outlet '{$outlet->name}' has been created successfully.");
     }
 
-    public function edit(Outlet $outlet): View
+    public function edit(Request $request, Outlet $outlet): View
     {
+        $user = $request->user();
+        if (! $user->canManageOutlet($outlet->id)) {
+            abort(403, 'Unauthorized to edit this store outlet.');
+        }
+
         $regions = Region::orderBy('name')->get();
 
         return view('outlets.edit', compact('outlet', 'regions'));
@@ -110,6 +121,11 @@ class OutletController extends Controller
 
     public function update(Request $request, Outlet $outlet): RedirectResponse
     {
+        $user = $request->user();
+        if (! $user->canManageOutlet($outlet->id)) {
+            abort(403, 'Unauthorized to update this store outlet.');
+        }
+
         $validated = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'outlet_code' => ['required', 'string', 'max:50', 'unique:outlets,outlet_code,'.$outlet->id],
@@ -133,8 +149,13 @@ class OutletController extends Controller
             ->with('status', "Outlet '{$outlet->name}' has been updated.");
     }
 
-    public function destroy(Outlet $outlet): RedirectResponse
+    public function destroy(Request $request, Outlet $outlet): RedirectResponse
     {
+        $user = $request->user();
+        if (! $user->isSuperAdmin()) {
+            abort(403, 'Only Corporate Super Administrators can delete outlets.');
+        }
+
         $name = $outlet->name;
         $outlet->delete();
 

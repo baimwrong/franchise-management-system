@@ -153,15 +153,29 @@ class BulkImportService
             rewind($handle);
         }
 
+        // Sniff delimiter from first line
+        $firstLine = fgets($handle);
+        if ($firstLine === false) {
+            fclose($handle);
+
+            return [];
+        }
+
+        $semicolonCount = substr_count($firstLine, ';');
+        $commaCount = substr_count($firstLine, ',');
+        $delimiter = ($semicolonCount > $commaCount) ? ';' : ',';
+
+        // Rewind and skip BOM again
+        rewind($handle);
+        $bom = fread($handle, 3);
+        if ($bom !== "\xEF\xBB\xBF") {
+            rewind($handle);
+        }
+
         $header = null;
         $rows = [];
 
-        while (($data = fgetcsv($handle, 0, ',')) !== false) {
-            // If single string with semicolons, parse with semicolon delimiter
-            if (count($data) === 1 && str_contains($data[0], ';')) {
-                $data = str_getcsv($data[0], ';');
-            }
-
+        while (($data = fgetcsv($handle, 0, $delimiter)) !== false) {
             // Clean headers and rows
             $data = array_map(fn ($val) => trim((string) $val), $data);
 
@@ -316,18 +330,27 @@ class BulkImportService
             }
         }
 
-        $password = ! empty($row['password']) ? trim($row['password']) : 'Password123!';
+        $email = strtolower(trim($row['email']));
+        $existingUser = User::where('email', $email)->first();
+
+        $userData = [
+            'name' => trim($row['name']),
+            'role' => $row['role'],
+            'outlet_id' => $outletId,
+            'phone' => ! empty($row['phone']) ? trim($row['phone']) : null,
+            'is_active' => true,
+        ];
+
+        // Do not wipe out custom passwords on staff re-import
+        if (! empty($row['password'])) {
+            $userData['password'] = Hash::make(trim($row['password']));
+        } elseif (! $existingUser) {
+            $userData['password'] = Hash::make('Password123!');
+        }
 
         User::updateOrCreate(
-            ['email' => strtolower(trim($row['email']))],
-            [
-                'name' => trim($row['name']),
-                'role' => $row['role'],
-                'outlet_id' => $outletId,
-                'phone' => ! empty($row['phone']) ? trim($row['phone']) : null,
-                'password' => Hash::make($password),
-                'is_active' => true,
-            ]
+            ['email' => $email],
+            $userData
         );
     }
 
@@ -356,7 +379,7 @@ class BulkImportService
             ? Carbon::parse($row['transaction_date'])
             : now();
 
-        SalesTransaction::updateOrCreate(
+        $transaction = SalesTransaction::updateOrCreate(
             ['transaction_code' => trim($row['transaction_code'])],
             [
                 'outlet_id' => $outlet->id,
@@ -372,5 +395,28 @@ class BulkImportService
                 'transaction_date' => $transactionDate,
             ]
         );
+
+        // If product SKU is included in row, record line item
+        if (! empty($row['sku'])) {
+            $product = Product::where('sku', trim($row['sku']))->first();
+            if ($product) {
+                $qty = is_numeric($row['quantity'] ?? null) ? (float) $row['quantity'] : 1.0;
+                $unitPrice = is_numeric($row['unit_price'] ?? null) ? (float) $row['unit_price'] : (float) $product->suggested_retail_price;
+                $lineSubtotal = $qty * $unitPrice;
+
+                $transaction->items()->updateOrCreate(
+                    [
+                        'product_id' => $product->id,
+                        'sku' => $product->sku,
+                    ],
+                    [
+                        'product_name' => $product->name,
+                        'unit_price' => $unitPrice,
+                        'quantity' => $qty,
+                        'subtotal' => $lineSubtotal,
+                    ]
+                );
+            }
+        }
     }
 }

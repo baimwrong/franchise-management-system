@@ -11,6 +11,7 @@ use App\Models\SalesTransaction;
 use App\Models\SupplyOrder;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\View\View;
 
 class DashboardController extends Controller
@@ -30,21 +31,24 @@ class DashboardController extends Controller
             $selectedOutletId = $user->outlet_id;
         }
 
-        $outletScope = Outlet::query();
-        if ($selectedOutletId) {
-            $outletScope->where('id', $selectedOutletId);
+        // Verify that selected outlet is accessible to this user
+        if ($selectedOutletId && ! $user->canManageOutlet((int) $selectedOutletId)) {
+            $selectedOutletId = $user->outlet_id ?: null;
         }
 
-        $allOutlets = Outlet::orderBy('name')->get();
+        $allOutlets = $user->accessibleOutletsQuery()->orderBy('name')->get();
         $selectedOutlet = $selectedOutletId ? Outlet::find($selectedOutletId) : null;
 
         // KPI Calculations
-        $totalOutlets = Outlet::count();
-        $activeOutlets = Outlet::where('status', 'active')->count();
+        $totalOutlets = $user->accessibleOutletsQuery()->count();
+        $activeOutlets = $user->accessibleOutletsQuery()->where('status', 'active')->count();
 
         $salesQuery = SalesTransaction::query()->where('payment_status', 'paid');
         if ($selectedOutletId) {
             $salesQuery->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $salesQuery->whereIn('outlet_id', $accessibleIds);
         }
 
         $startOfMonth = now()->startOfMonth();
@@ -58,6 +62,9 @@ class DashboardController extends Controller
         $inventoryQuery = InventoryStock::query()->whereColumn('quantity_on_hand', '<=', 'reorder_threshold');
         if ($selectedOutletId) {
             $inventoryQuery->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $inventoryQuery->whereIn('outlet_id', $accessibleIds);
         }
         $lowStockCount = $inventoryQuery->count();
 
@@ -65,6 +72,9 @@ class DashboardController extends Controller
         $supplyOrderQuery = SupplyOrder::where('status', 'pending');
         if ($selectedOutletId) {
             $supplyOrderQuery->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $supplyOrderQuery->whereIn('outlet_id', $accessibleIds);
         }
         $pendingSupplyOrders = $supplyOrderQuery->count();
 
@@ -72,6 +82,9 @@ class DashboardController extends Controller
         $royaltyQuery = RoyaltyInvoice::whereIn('status', ['issued', 'overdue']);
         if ($selectedOutletId) {
             $royaltyQuery->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $royaltyQuery->whereIn('outlet_id', $accessibleIds);
         }
         $unpaidRoyaltiesAmount = (float) $royaltyQuery->sum('total_amount_due');
 
@@ -85,12 +98,13 @@ class DashboardController extends Controller
         // Recent supply orders
         $recentSupplyOrders = SupplyOrder::with(['outlet', 'requestedBy'])
             ->when($selectedOutletId, fn ($q) => $q->where('outlet_id', $selectedOutletId))
+            ->when(! $selectedOutletId && ! $user->isSuperAdmin(), fn ($q) => $q->whereIn('outlet_id', $user->accessibleOutletsQuery()->pluck('id')))
             ->latest()
             ->limit(6)
             ->get();
 
         // Outlet Performance Comparison (Top Outlets by Sales this month)
-        $outletPerformance = Outlet::withSum([
+        $outletPerformance = $user->accessibleOutletsQuery()->withSum([
             'salesTransactions' => function ($q) use ($startOfMonth) {
                 $q->where('payment_status', 'paid')->where('transaction_date', '>=', $startOfMonth);
             },
@@ -106,16 +120,21 @@ class DashboardController extends Controller
             ->limit(5)
             ->get();
 
-        // Chart Data: Past 7 Days Sales Trend
+        // Chart Data: Past 7 Days Sales Trend (Aggregated into 1 Query)
+        $sevenDaysAgo = now()->subDays(6)->startOfDay();
+        $dailySales = (clone $salesQuery)
+            ->where('transaction_date', '>=', $sevenDaysAgo)
+            ->selectRaw('DATE(transaction_date) as day_date, SUM(total_amount) as day_total')
+            ->groupBy(DB::raw('DATE(transaction_date)'))
+            ->pluck('day_total', 'day_date');
+
         $chartLabels = [];
         $chartSalesData = [];
         for ($i = 6; $i >= 0; $i--) {
             $day = now()->subDays($i);
             $chartLabels[] = $day->format('M d');
-            $daySales = (float) (clone $salesQuery)
-                ->whereDate('transaction_date', $day->toDateString())
-                ->sum('total_amount');
-            $chartSalesData[] = $daySales;
+            $dateKey = $day->format('Y-m-d');
+            $chartSalesData[] = (float) ($dailySales[$dateKey] ?? 0.00);
         }
 
         return view('dashboard.index', compact(
@@ -143,10 +162,18 @@ class DashboardController extends Controller
 
     public function switchOutlet(Request $request): RedirectResponse
     {
+        $user = $request->user();
         $outletId = $request->input('outlet_id');
-        if ($outletId && Outlet::where('id', $outletId)->exists()) {
+
+        if ($outletId) {
+            if (! $user->canManageOutlet((int) $outletId)) {
+                abort(403, 'Unauthorized to switch to this outlet context.');
+            }
             $request->session()->put('active_outlet_id', (int) $outletId);
         } else {
+            if (! $user->isSuperAdmin() && ! $user->isFranchiseOwner()) {
+                abort(403, 'Unauthorized to view consolidated brand context.');
+            }
             $request->session()->forget('active_outlet_id');
         }
 

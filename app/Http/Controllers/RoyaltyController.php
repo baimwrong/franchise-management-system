@@ -25,14 +25,17 @@ class RoyaltyController extends Controller
             ?? $request->session()->get('active_outlet_id')
             ?? ($user->outlet_id ?: null);
 
-        if (! $user->isSuperAdmin() && ! $user->isFranchiseOwner() && $user->outlet_id) {
-            $selectedOutletId = $user->outlet_id;
+        if ($selectedOutletId && ! $user->canManageOutlet((int) $selectedOutletId)) {
+            $selectedOutletId = $user->outlet_id ?: null;
         }
 
         $query = RoyaltyInvoice::with('outlet');
 
         if ($selectedOutletId) {
             $query->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $query->whereIn('outlet_id', $accessibleIds);
         }
 
         if ($status = $request->input('status')) {
@@ -40,7 +43,7 @@ class RoyaltyController extends Controller
         }
 
         $invoices = $query->latest('period_start')->paginate(15)->withQueryString();
-        $outlets = Outlet::where('type', 'franchise')->orderBy('name')->get();
+        $outlets = $user->accessibleOutletsQuery()->where('type', 'franchise')->orderBy('name')->get();
         $brand = Brand::first();
 
         $totalRoyaltiesDue = (float) (clone $query)->whereIn('status', ['issued', 'overdue'])->sum('total_amount_due');
@@ -56,8 +59,13 @@ class RoyaltyController extends Controller
         ));
     }
 
-    public function show(RoyaltyInvoice $royaltyInvoice): View
+    public function show(Request $request, RoyaltyInvoice $royaltyInvoice): View
     {
+        $user = $request->user();
+        if (! $user->canManageOutlet($royaltyInvoice->outlet_id)) {
+            abort(403, 'Unauthorized to view this royalty billing invoice.');
+        }
+
         $royaltyInvoice->load('outlet.brand');
 
         return view('royalties.show', compact('royaltyInvoice'));
@@ -90,6 +98,11 @@ class RoyaltyController extends Controller
 
     public function markAsPaid(Request $request, RoyaltyInvoice $royaltyInvoice): RedirectResponse
     {
+        $user = $request->user();
+        if (! $user->isSuperAdmin()) {
+            abort(403, 'Only Corporate Super Administrators can verify and mark royalty invoices as paid.');
+        }
+
         $validated = $request->validate([
             'payment_reference' => ['required', 'string', 'max:100'],
             'notes' => ['nullable', 'string', 'max:500'],

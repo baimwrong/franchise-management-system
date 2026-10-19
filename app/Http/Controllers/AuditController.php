@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Brand;
 use App\Models\Outlet;
 use App\Models\OutletAudit;
 use Illuminate\Http\RedirectResponse;
@@ -18,26 +19,34 @@ class AuditController extends Controller
             ?? $request->session()->get('active_outlet_id')
             ?? ($user->outlet_id ?: null);
 
-        if (! $user->isSuperAdmin() && ! $user->isFranchiseOwner() && $user->outlet_id) {
-            $selectedOutletId = $user->outlet_id;
+        if ($selectedOutletId && ! $user->canManageOutlet((int) $selectedOutletId)) {
+            $selectedOutletId = $user->outlet_id ?: null;
         }
 
         $query = OutletAudit::with(['outlet', 'auditor']);
 
         if ($selectedOutletId) {
             $query->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $query->whereIn('outlet_id', $accessibleIds);
         }
 
         $audits = $query->latest('audit_date')->paginate(15)->withQueryString();
-        $outlets = Outlet::orderBy('name')->get();
+        $outlets = $user->accessibleOutletsQuery()->orderBy('name')->get();
 
         $averageAuditScore = (float) (clone $query)->avg('overall_score');
 
         return view('audits.index', compact('audits', 'outlets', 'selectedOutletId', 'averageAuditScore'));
     }
 
-    public function show(OutletAudit $outletAudit): View
+    public function show(Request $request, OutletAudit $outletAudit): View
     {
+        $user = $request->user();
+        if (! $user->canManageOutlet($outletAudit->outlet_id)) {
+            abort(403, 'Unauthorized to view audits for this outlet.');
+        }
+
         $outletAudit->load(['outlet', 'auditor']);
 
         return view('audits.show', compact('outletAudit'));
@@ -71,7 +80,9 @@ class AuditController extends Controller
             $validated['customer_service_score']
         ) / 4, 2);
 
-        $passed = $overall >= 75.00;
+        $brand = Brand::first();
+        $passingThreshold = (float) ($brand->settings['minimum_audit_passing_score'] ?? 75.00);
+        $passed = $overall >= $passingThreshold;
 
         $audit = OutletAudit::create([
             'outlet_id' => $validated['outlet_id'],

@@ -6,13 +6,14 @@ use Database\Factories\UserFactory;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 
 class User extends Authenticatable
 {
     /** @use HasFactory<UserFactory> */
-    use HasFactory, Notifiable;
+    use HasFactory, Notifiable, SoftDeletes;
 
     protected $fillable = [
         'name',
@@ -75,10 +76,36 @@ class User extends Authenticatable
         return $this->role === 'staff';
     }
 
+    public function accessibleOutletsQuery()
+    {
+        if ($this->isSuperAdmin()) {
+            return Outlet::query();
+        }
+
+        if ($this->isFranchiseOwner()) {
+            return Outlet::where(function ($q) {
+                if ($this->outlet_id) {
+                    $q->where('id', $this->outlet_id);
+                }
+                $q->orWhere('franchisee_name', 'like', "%{$this->name}%");
+            });
+        }
+
+        return Outlet::where('id', $this->outlet_id ?? 0);
+    }
+
     public function canManageOutlet(int $outletId): bool
     {
         if ($this->isSuperAdmin()) {
             return true;
+        }
+
+        if ($this->isFranchiseOwner()) {
+            if ($this->outlet_id === $outletId) {
+                return true;
+            }
+
+            return $this->accessibleOutletsQuery()->where('id', $outletId)->exists();
         }
 
         return $this->outlet_id === $outletId;

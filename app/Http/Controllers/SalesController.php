@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\InventoryStock;
 use App\Models\Outlet;
+use App\Models\OutletProduct;
 use App\Models\Product;
 use App\Models\SalesTransaction;
 use Illuminate\Http\RedirectResponse;
@@ -21,14 +22,17 @@ class SalesController extends Controller
             ?? $request->session()->get('active_outlet_id')
             ?? ($user->outlet_id ?: null);
 
-        if (! $user->isSuperAdmin() && ! $user->isFranchiseOwner() && $user->outlet_id) {
-            $selectedOutletId = $user->outlet_id;
+        if ($selectedOutletId && ! $user->canManageOutlet((int) $selectedOutletId)) {
+            $selectedOutletId = $user->outlet_id ?: null;
         }
 
         $query = SalesTransaction::with(['outlet', 'user'])->withCount('items');
 
         if ($selectedOutletId) {
             $query->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $query->whereIn('outlet_id', $accessibleIds);
         }
 
         if ($search = $request->input('search')) {
@@ -43,15 +47,20 @@ class SalesController extends Controller
         }
 
         $transactions = $query->latest('transaction_date')->paginate(15)->withQueryString();
-        $outlets = Outlet::orderBy('name')->get();
+        $outlets = $user->accessibleOutletsQuery()->orderBy('name')->get();
 
         $periodSalesTotal = (float) (clone $query)->where('payment_status', 'paid')->sum('total_amount');
 
         return view('sales.index', compact('transactions', 'outlets', 'selectedOutletId', 'periodSalesTotal'));
     }
 
-    public function show(SalesTransaction $salesTransaction): View
+    public function show(Request $request, SalesTransaction $salesTransaction): View
     {
+        $user = $request->user();
+        if (! $user->canManageOutlet($salesTransaction->outlet_id)) {
+            abort(403, 'Unauthorized to view sales transactions for this outlet.');
+        }
+
         $salesTransaction->load(['outlet', 'user', 'items.product']);
 
         return view('sales.show', compact('salesTransaction'));
@@ -60,9 +69,7 @@ class SalesController extends Controller
     public function create(Request $request): View
     {
         $user = $request->user();
-        $outlets = $user->isSuperAdmin()
-            ? Outlet::active()->orderBy('name')->get()
-            : Outlet::where('id', $user->outlet_id)->get();
+        $outlets = $user->accessibleOutletsQuery()->active()->orderBy('name')->get();
 
         $currentOutletId = $request->query('outlet_id') ?? $user->outlet_id ?? $outlets->first()?->id;
         $currentOutlet = Outlet::find($currentOutletId);
@@ -104,7 +111,12 @@ class SalesController extends Controller
 
                 $product = Product::findOrFail($itemData['product_id']);
                 $qty = (float) $itemData['quantity'];
-                $price = (float) $product->suggested_retail_price;
+
+                // Check outlet-specific selling price override, fallback to global MSRP
+                $outletProduct = OutletProduct::where('outlet_id', $outlet->id)
+                    ->where('product_id', $product->id)
+                    ->first();
+                $price = (float) ($outletProduct?->selling_price ?? $product->suggested_retail_price);
                 $lineSubtotal = $qty * $price;
 
                 $itemsToCreate[] = [
@@ -118,12 +130,23 @@ class SalesController extends Controller
 
                 $subtotal += $lineSubtotal;
 
-                // Deplete outlet inventory stock if tracked
+                // Deplete outlet inventory stock with pessimistic row lock
                 if ($product->is_track_inventory) {
-                    $stock = InventoryStock::firstOrCreate(
-                        ['outlet_id' => $outlet->id, 'product_id' => $product->id],
-                        ['quantity_on_hand' => 0, 'reorder_threshold' => 10, 'target_stock_level' => 50]
-                    );
+                    $stock = InventoryStock::where('outlet_id', $outlet->id)
+                        ->where('product_id', $product->id)
+                        ->lockForUpdate()
+                        ->first();
+
+                    if (! $stock) {
+                        $stock = InventoryStock::create([
+                            'outlet_id' => $outlet->id,
+                            'product_id' => $product->id,
+                            'quantity_on_hand' => 0,
+                            'reorder_threshold' => 10,
+                            'target_stock_level' => 50,
+                        ]);
+                    }
+
                     $stock->decrement('quantity_on_hand', $qty);
                 }
             }

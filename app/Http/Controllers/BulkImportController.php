@@ -53,9 +53,14 @@ class BulkImportController extends Controller
         $msg = "Bulk import completed. {$result['imported_count']} rows imported successfully, {$result['failed_count']} failed.";
 
         if ($result['failed_count'] > 0) {
+            $sampleErrors = array_slice($result['errors'], 0, 20);
+            if (count($result['errors']) > 20) {
+                $sampleErrors[] = '... and '.(count($result['errors']) - 20).' more errors. Check import history details.';
+            }
+
             return redirect()->route('admin.bulk-imports.index')
                 ->with('status', $msg)
-                ->with('import_errors', $result['errors']);
+                ->with('import_errors', $sampleErrors);
         }
 
         return redirect()->route('admin.bulk-imports.index')

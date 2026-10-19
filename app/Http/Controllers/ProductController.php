@@ -123,14 +123,17 @@ class ProductController extends Controller
         ]);
 
         $brand = Brand::first();
-        Category::create([
-            'brand_id' => $brand?->id ?? 1,
-            'name' => $validated['name'],
-            'slug' => Str::slug($validated['name']),
-            'description' => $validated['description'] ?? null,
-            'is_active' => true,
-        ]);
+        $slug = Str::slug($validated['name']);
 
-        return back()->with('status', "Category '{$validated['name']}' created successfully.");
+        Category::firstOrCreate(
+            ['brand_id' => $brand?->id ?? 1, 'slug' => $slug],
+            [
+                'name' => $validated['name'],
+                'description' => $validated['description'] ?? null,
+                'is_active' => true,
+            ]
+        );
+
+        return back()->with('status', "Category '{$validated['name']}' saved successfully.");
     }
 }

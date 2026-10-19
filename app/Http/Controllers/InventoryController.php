@@ -22,14 +22,17 @@ class InventoryController extends Controller
             ?? $request->session()->get('active_outlet_id')
             ?? ($user->outlet_id ?: null);
 
-        if (! $user->isSuperAdmin() && ! $user->isFranchiseOwner() && $user->outlet_id) {
-            $selectedOutletId = $user->outlet_id;
+        if ($selectedOutletId && ! $user->canManageOutlet((int) $selectedOutletId)) {
+            $selectedOutletId = $user->outlet_id ?: null;
         }
 
         $query = InventoryStock::with(['outlet', 'product.category']);
 
         if ($selectedOutletId) {
             $query->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $query->whereIn('outlet_id', $accessibleIds);
         }
 
         if ($search = $request->input('search')) {
@@ -39,15 +42,15 @@ class InventoryController extends Controller
             });
         }
 
+        $lowStockTotal = (clone $query)->whereColumn('quantity_on_hand', '<=', 'reorder_threshold')->count();
+
         if ($request->boolean('low_stock_only')) {
             $query->whereColumn('quantity_on_hand', '<=', 'reorder_threshold');
         }
 
         $stocks = $query->orderBy('quantity_on_hand', 'asc')->paginate(20)->withQueryString();
-        $outlets = Outlet::orderBy('name')->get();
+        $outlets = $user->accessibleOutletsQuery()->orderBy('name')->get();
         $selectedOutlet = $selectedOutletId ? Outlet::find($selectedOutletId) : null;
-
-        $lowStockTotal = (clone $query)->whereColumn('quantity_on_hand', '<=', 'reorder_threshold')->count();
 
         return view('inventory.index', compact(
             'stocks',
@@ -74,17 +77,20 @@ class InventoryController extends Controller
         }
 
         DB::transaction(function () use ($validated, $user) {
-            $stock = InventoryStock::firstOrCreate(
-                [
+            $stock = InventoryStock::where('outlet_id', $validated['outlet_id'])
+                ->where('product_id', $validated['product_id'])
+                ->lockForUpdate()
+                ->first();
+
+            if (! $stock) {
+                $stock = InventoryStock::create([
                     'outlet_id' => $validated['outlet_id'],
                     'product_id' => $validated['product_id'],
-                ],
-                [
                     'quantity_on_hand' => 0,
                     'reorder_threshold' => 10,
                     'target_stock_level' => 50,
-                ]
-            );
+                ]);
+            }
 
             $previousQty = (float) $stock->quantity_on_hand;
             $adjQty = (float) $validated['adjustment_quantity'];
@@ -123,12 +129,22 @@ class InventoryController extends Controller
             ?? $request->session()->get('active_outlet_id')
             ?? ($user->outlet_id ?: null);
 
-        $adjustments = StockAdjustment::with(['outlet', 'user', 'items.product'])
-            ->when($selectedOutletId, fn ($q) => $q->where('outlet_id', $selectedOutletId))
-            ->latest('adjustment_date')
+        if ($selectedOutletId && ! $user->canManageOutlet((int) $selectedOutletId)) {
+            $selectedOutletId = $user->outlet_id ?: null;
+        }
+
+        $query = StockAdjustment::with(['outlet', 'user', 'items.product']);
+        if ($selectedOutletId) {
+            $query->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $query->whereIn('outlet_id', $accessibleIds);
+        }
+
+        $adjustments = $query->latest('adjustment_date')
             ->paginate(15);
 
-        $outlets = Outlet::orderBy('name')->get();
+        $outlets = $user->accessibleOutletsQuery()->orderBy('name')->get();
 
         return view('inventory.adjustments', compact('adjustments', 'outlets', 'selectedOutletId'));
     }

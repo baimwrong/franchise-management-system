@@ -23,8 +23,8 @@ class SupplyOrderController extends Controller
             ?? $request->session()->get('active_outlet_id')
             ?? ($user->outlet_id ?: null);
 
-        if (! $user->isSuperAdmin() && ! $user->isFranchiseOwner() && $user->outlet_id) {
-            $selectedOutletId = $user->outlet_id;
+        if ($selectedOutletId && ! $user->canManageOutlet((int) $selectedOutletId)) {
+            $selectedOutletId = $user->outlet_id ?: null;
         }
 
         $query = SupplyOrder::with(['outlet', 'requestedBy', 'processedBy'])
@@ -32,6 +32,9 @@ class SupplyOrderController extends Controller
 
         if ($selectedOutletId) {
             $query->where('outlet_id', $selectedOutletId);
+        } elseif (! $user->isSuperAdmin()) {
+            $accessibleIds = $user->accessibleOutletsQuery()->pluck('id');
+            $query->whereIn('outlet_id', $accessibleIds);
         }
 
         if ($status = $request->input('status')) {
@@ -39,13 +42,18 @@ class SupplyOrderController extends Controller
         }
 
         $orders = $query->latest()->paginate(15)->withQueryString();
-        $outlets = Outlet::orderBy('name')->get();
+        $outlets = $user->accessibleOutletsQuery()->orderBy('name')->get();
 
         return view('supply_orders.index', compact('orders', 'outlets', 'selectedOutletId'));
     }
 
-    public function show(SupplyOrder $supplyOrder): View
+    public function show(Request $request, SupplyOrder $supplyOrder): View
     {
+        $user = $request->user();
+        if (! $user->canManageOutlet($supplyOrder->outlet_id)) {
+            abort(403, 'Unauthorized to view this requisition order.');
+        }
+
         $supplyOrder->load(['outlet', 'requestedBy', 'processedBy', 'items.product']);
 
         return view('supply_orders.show', compact('supplyOrder'));
@@ -54,9 +62,7 @@ class SupplyOrderController extends Controller
     public function create(Request $request): View
     {
         $user = $request->user();
-        $outlets = $user->isSuperAdmin()
-            ? Outlet::active()->orderBy('name')->get()
-            : Outlet::where('id', $user->outlet_id)->get();
+        $outlets = $user->accessibleOutletsQuery()->active()->orderBy('name')->get();
 
         $products = Product::where('is_active', true)->orderBy('name')->get();
 
@@ -131,6 +137,32 @@ class SupplyOrderController extends Controller
         $user = $request->user();
         $targetStatus = $validated['status'];
 
+        // Strict role & state machine authorization
+        if (in_array($targetStatus, ['approved', 'processing', 'dispatched'], true)) {
+            if (! $user->isSuperAdmin()) {
+                abort(403, 'Only Central Headquarters Super Administrators can approve and dispatch supply orders.');
+            }
+        }
+
+        if ($targetStatus === 'received') {
+            if (! $user->canManageOutlet($supplyOrder->outlet_id)) {
+                abort(403, 'Unauthorized to confirm receipt for this destination outlet.');
+            }
+            if ($supplyOrder->status !== 'dispatched') {
+                return back()->withErrors(['error' => 'Supply orders can only be marked as received after being dispatched by Headquarters.']);
+            }
+        }
+
+        if ($targetStatus === 'cancelled') {
+            if (! $user->isSuperAdmin() && ! ($user->canManageOutlet($supplyOrder->outlet_id) && $supplyOrder->status === 'pending')) {
+                abort(403, 'Orders can only be cancelled while in pending status.');
+            }
+        }
+
+        if ($supplyOrder->status === 'received') {
+            return back()->withErrors(['error' => 'This supply order has already been received and closed.']);
+        }
+
         DB::transaction(function () use ($supplyOrder, $targetStatus, $user) {
             $updates = [
                 'status' => $targetStatus,
@@ -139,7 +171,6 @@ class SupplyOrderController extends Controller
 
             if ($targetStatus === 'approved') {
                 $updates['approved_at'] = now();
-                // Fulfill requested quantities by default on approval
                 foreach ($supplyOrder->items as $item) {
                     $item->update(['quantity_fulfilled' => $item->quantity_requested]);
                 }
@@ -148,19 +179,22 @@ class SupplyOrderController extends Controller
             } elseif ($targetStatus === 'received') {
                 $updates['received_at'] = now();
 
-                // Increment stock on hand at destination outlet
+                // Increment stock on hand at destination outlet with pessimistic row lock
                 foreach ($supplyOrder->items as $item) {
-                    $stock = InventoryStock::firstOrCreate(
-                        [
+                    $stock = InventoryStock::where('outlet_id', $supplyOrder->outlet_id)
+                        ->where('product_id', $item->product_id)
+                        ->lockForUpdate()
+                        ->first();
+
+                    if (! $stock) {
+                        $stock = InventoryStock::create([
                             'outlet_id' => $supplyOrder->outlet_id,
                             'product_id' => $item->product_id,
-                        ],
-                        [
                             'quantity_on_hand' => 0,
                             'reorder_threshold' => 10,
                             'target_stock_level' => 50,
-                        ]
-                    );
+                        ]);
+                    }
 
                     $fulfilledQty = (float) ($item->quantity_fulfilled ?: $item->quantity_requested);
                     $stock->increment('quantity_on_hand', $fulfilledQty);
